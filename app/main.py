@@ -1,16 +1,18 @@
-"""FastAPI 入口：上传核查、查询现役版本、历史记录、静态页面。"""
+"""FastAPI 入口：上传核查、查询现役版本、历史记录、版本恢复、静态页面。"""
 from __future__ import annotations
 
 import json
 import os
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse
+from pydantic import BaseModel
 
 from .evaluator import FormatError, build_report, parse_dependencies, parse_sources
-from .store import SnapshotStore
+from .store import (ConflictError, SnapshotNotFound, SnapshotStore,
+                    UnrecoverableError)
 
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
@@ -20,7 +22,12 @@ DB_PATH = os.environ.get("DB_PATH", str(BASE_DIR.parent / "data" / "dwcheck.db")
 MAX_UPLOAD_BYTES = 20 * 1024 * 1024  # 单文件 20MB 上限
 
 store = SnapshotStore(DB_PATH)
-app = FastAPI(title="环境监测数仓字段变更核查", version="1.0.0")
+app = FastAPI(title="环境监测数仓字段变更核查", version="1.1.0")
+
+
+class RestoreRequest(BaseModel):
+    # 发起恢复时页面上的现役版本 id；与库中现役不一致则 409（乐观围栏）
+    base_id: Optional[int] = None
 
 
 async def _read_json(upload: UploadFile, label: str) -> Any:
@@ -57,8 +64,13 @@ async def create_snapshot(
     sources_after: UploadFile = File(..., description="变更后源字段清单 JSON"),
     dependencies: UploadFile = File(..., description="跨作业字段依赖 JSON"),
     name: str = Form(""),
+    base_id: Optional[int] = Form(None, description="发起核查时的现役版本 id（乐观围栏）"),
 ):
-    """上传三份清单并核查。成功则整版替换现役版本；失败保留旧版并留痕。"""
+    """上传三份清单并核查。成功则整版替换现役版本；失败保留旧版并留痕。
+
+    带 base_id 时，若现役版本已被他人（例如一次历史恢复）抢先替换，本次结果不发布、
+    返回 409——迟到的核查不会覆盖恢复结果。
+    """
     snap_name = name.strip() or f"核查-{dependencies.filename or '未命名'}"
     try:
         payload = build_payload(
@@ -70,7 +82,10 @@ async def create_snapshot(
     except FormatError as e:
         store.record_failed(snap_name, str(e))
         raise HTTPException(status_code=400, detail=str(e)) from e
-    snap_id = store.publish(snap_name, payload)
+    try:
+        snap_id = store.publish(snap_name, payload, base_id=base_id)
+    except ConflictError as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
     return {"id": snap_id, "name": snap_name, "summary": payload["report"]["summary"]}
 
 
@@ -81,6 +96,33 @@ async def get_current():
     if not cur:
         raise HTTPException(status_code=404, detail="暂无现役版本，请先上传核查")
     return cur
+
+
+@app.get("/api/snapshots/{snapshot_id}")
+async def get_snapshot(snapshot_id: int):
+    """查看某个历史快照的完整内容与结论；失败记录只返回留痕信息（无 payload）。"""
+    snap = store.get_snapshot(snapshot_id)
+    if not snap:
+        raise HTTPException(status_code=404, detail=f"历史版本 #{snapshot_id} 不存在")
+    return snap
+
+
+@app.post("/api/snapshots/{snapshot_id}/restore")
+async def restore_snapshot(snapshot_id: int, req: RestoreRequest):
+    """从历史成功版本恢复：完整内容原样复制为新现役版本，并记录来源。
+
+    - 失败记录不可恢复（400）；版本不存在（404）；
+    - base_id 与现役不一致（409），原版本保留，提示冲突。
+    """
+    try:
+        result = store.restore(snapshot_id, base_id=req.base_id)
+    except SnapshotNotFound as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+    except UnrecoverableError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except ConflictError as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
+    return result
 
 
 @app.get("/api/snapshots")
